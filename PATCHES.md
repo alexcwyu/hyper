@@ -73,10 +73,11 @@ Added in this commit:
 - `proto::h1::io::tests::gateway_pipeline_flushes_when_next_header_is_read_blocked`
 - `proto::h1::io::tests::gateway_pipeline_shutdown_flushes_with_unconsumed_next_input`
 
-Patch 2 is covered from outside by webgateway-rust (`tests/hyper_body.rs`: a buffered body arrives in the first poll,
-pipelined bodies arrive whole and in order, a body still on its way streams, chunked bodies decode, an
-`Expect: 100-continue` request is answered before its body is read, and a buffered body costs the connection no
-allocation of its own).
+Patch 2 has its own integration test, `tests/aeron_gateway_body.rs` (`cargo test --features full --test
+aeron_gateway_body`): a buffered body arrives in the first poll; pipelined bodies arrive whole and in order; a body
+still on its way streams and reassembles; a request with a body does not disturb the one behind it; chunked bodies
+still decode; an `Expect: 100-continue` request is answered before its body is read; and a buffered body costs the
+connection no allocation of its own. The whole suite (`cargo test --features full`) passes on this branch.
 
 ## Measured effect
 
