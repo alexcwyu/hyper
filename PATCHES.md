@@ -77,7 +77,9 @@ Patch 2 has its own integration test, `tests/aeron_gateway_body.rs` (`cargo test
 aeron_gateway_body`): a buffered body arrives in the first poll; pipelined bodies arrive whole and in order; a body
 still on its way streams and reassembles; a request with a body does not disturb the one behind it; chunked bodies
 still decode; an `Expect: 100-continue` request is answered before its body is read; and a buffered body costs the
-connection no allocation of its own. The whole suite (`cargo test --features full`) passes on this branch.
+connection no allocation of its own; and (patch 4) a complete reply is still written when the request pipelined
+behind it is malformed or never finishes its head. On unpatched v1.12.0 the last test and the allocation test fail
+and the rest pass. The whole suite (`cargo test --features full`) passes on this branch.
 
 ## Measured effect
 

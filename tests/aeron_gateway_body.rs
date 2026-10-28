@@ -1,6 +1,8 @@
 //! Aeron gateway patch 2 (see PATCHES.md): a `Content-Length` request body that already sits in the read buffer is
 //! handed to the service whole, at the first poll, instead of streaming it through a channel that needs further
 //! passes of the connection to fill. Everything else about bodies must stay as it was.
+//!
+//! Also patch 4: a reply that is complete is written even when what follows it in the pipeline is a malformed head.
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -361,4 +363,19 @@ fn a_buffered_body_costs_the_connection_no_allocation_of_its_own() {
         bodied <= bare,
         "{rounds} requests with a body allocated {bodied} times, the same without one {bare}: the body must not need a channel"
     );
+}
+
+/// A complete reply is not discarded because the request pipelined behind it is malformed or never finishes its head.
+#[test]
+fn a_malformed_next_head_does_not_lose_the_completed_reply() {
+    for tail in [
+        b"G@T / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec(),
+        [b"GET / HTTP/1.1\r\nX: ".as_slice(), &vec![b'x'; 10_000]].concat(),
+    ] {
+        let mut run = Run::new();
+        let mut wire = b"GET /work?input=41 HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+        wire.extend(tail);
+        run.feed(&wire);
+        assert_eq!(run.answers(), 1, "the first request's reply must be written before the connection ends");
+    }
 }
