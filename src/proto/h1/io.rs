@@ -31,6 +31,8 @@ const MAX_BUF_LIST_BUFFERS: usize = 16;
 
 pub(crate) struct Buffered<T, B> {
     flush_pipeline: bool,
+    pipeline_output: usize,
+    pipeline_grace: u8,
     io: T,
     partial_len: Option<usize>,
     read_blocked: bool,
@@ -65,6 +67,8 @@ where
         let write_buf = WriteBuf::new(strategy);
         Buffered {
             flush_pipeline: false,
+            pipeline_output: 0,
+            pipeline_grace: 16,
             io,
             partial_len: None,
             read_blocked: false,
@@ -76,7 +80,8 @@ where
 
     #[cfg(feature = "server")]
     pub(crate) fn set_flush_pipeline(&mut self, enabled: bool) {
-        debug_assert!(!self.write_buf.has_remaining());
+        // Turning coalescing OFF is how a pending reply gets flushed; only turning it on needs an empty buffer.
+        debug_assert!(!enabled || !self.write_buf.has_remaining());
         self.flush_pipeline = enabled;
         if enabled {
             self.set_write_strategy_flatten();
@@ -113,6 +118,12 @@ where
 
     pub(crate) fn read_buf(&self) -> &[u8] {
         self.read_buf.as_ref()
+    }
+
+    /// The next `len` buffered bytes as one chunk, when all of them are here already.
+    #[cfg(feature = "server")]
+    pub(crate) fn take_buffered(&mut self, len: usize) -> Option<Bytes> {
+        (self.read_buf.len() >= len).then(|| self.read_buf.split_to(len).freeze())
     }
 
     #[cfg(test)]
@@ -155,7 +166,7 @@ where
     }
 
     pub(crate) fn can_buffer(&self) -> bool {
-        self.flush_pipeline || self.write_buf.can_buffer()
+        self.write_buf.can_buffer()
     }
 
     pub(crate) fn consume_leading_lines(&mut self) {
@@ -275,14 +286,52 @@ where
         self.read_blocked
     }
 
+    /// Writes everything buffered, even though more input is already waiting. An upgrade hands the transport to
+    /// another protocol, so the reply that ends HTTP cannot be held back for a "next request" that will never be one.
+    #[cfg(feature = "server")]
+    pub(crate) fn poll_flush_now(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.flush_pipeline = false;
+        self.poll_flush(cx)
+    }
+
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.flush_pipeline && !self.read_buf.is_empty() {
-            Poll::Ready(Ok(()))
-        } else if self.write_buf.remaining() == 0 {
+        // Pipeline coalescing must stop when input is incomplete or output
+        // reaches its configured capacity. Otherwise a partial next head
+        // withholds completed replies, and continuous input bypasses output
+        // backpressure. Keep ordinary pipeline batching within those bounds.
+        let remaining = self.write_buf.remaining();
+        if remaining == 0 {
+            self.pipeline_output = 0;
+            self.pipeline_grace = 16;
+        }
+        if self.flush_pipeline && !self.read_buf.is_empty()
+            && !self.read_blocked && self.write_buf.can_buffer() {
+            if remaining == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            // A healthy pipeline adds completed output between polls. A stalled service can leave another
+            // complete request in read_buf forever; self-wake for at most sixteen deferrals of unchanged output,
+            // then flush it even though more input is buffered. A blocked write does not renew this grace.
+            if remaining != self.pipeline_output {
+                self.pipeline_output = remaining;
+                self.pipeline_grace = 16;
+            }
+            if self.pipeline_grace > 0 {
+                self.pipeline_grace -= 1;
+                cx.waker().wake_by_ref();
+                return Poll::Ready(Ok(()));
+            }
+        }
+        if remaining == 0 {
             Pin::new(&mut self.io).poll_flush(cx)
         } else {
             if let WriteStrategy::Flatten = self.write_buf.strategy {
-                return self.poll_flush_flattened(cx);
+                let result = self.poll_flush_flattened(cx);
+                if matches!(&result, Poll::Ready(Ok(()))) {
+                    self.pipeline_output = 0;
+                    self.pipeline_grace = 16;
+                }
+                return result;
             }
 
             const MAX_WRITEV_BUFS: usize = 64;
@@ -307,7 +356,12 @@ where
                     return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
                 }
             }
-            Pin::new(&mut self.io).poll_flush(cx)
+            let result = Pin::new(&mut self.io).poll_flush(cx);
+            if matches!(&result, Poll::Ready(Ok(()))) {
+                self.pipeline_output = 0;
+                self.pipeline_grace = 16;
+            }
+            result
         }
     }
 
@@ -335,6 +389,8 @@ where
     }
 
     pub(crate) fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // No subsequent request can justify withholding already completed replies.
+        self.flush_pipeline = false;
         ready!(self.poll_flush(cx))?;
         Pin::new(&mut self.io).poll_shutdown(cx)
     }
@@ -658,6 +714,53 @@ mod tests {
     use std::time::Duration;
 
     use tokio_test::io::Builder as Mock;
+
+    #[test]
+    fn gateway_pipeline_respects_configured_output_capacity() {
+        let mock = Mock::new().build();
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(mock));
+        buffered.set_flush_pipeline(true);
+        buffered.set_max_buf_size(8192);
+        buffered.headers_buf().resize(8192, 0);
+        assert!(!buffered.can_buffer(), "pipeline mode bypassed output capacity");
+    }
+
+    #[tokio::test]
+    async fn gateway_pipeline_flushes_at_output_capacity_with_more_input() {
+        let bytes = vec![b'x'; 8192];
+        let mock = Mock::new().write(&bytes).build();
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(mock));
+        buffered.set_flush_pipeline(true);
+        buffered.set_max_buf_size(8192);
+        buffered.read_buf.extend_from_slice(b"GET /next HTTP/1.1\r\nHost: local\r\n\r\n");
+        buffered.headers_buf().extend_from_slice(&bytes);
+        futures_util::future::poll_fn(|cx| buffered.poll_flush(cx)).await.unwrap();
+        assert_eq!(buffered.write_buf.remaining(), 0, "full pipeline output was not drained");
+    }
+
+    #[tokio::test]
+    async fn gateway_pipeline_flushes_when_next_header_is_read_blocked() {
+        let mock = Mock::new().write(b"reply").build();
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(mock));
+        buffered.set_flush_pipeline(true);
+        buffered.read_buf.extend_from_slice(b"GET /next HTTP/1.1\r\nHost: ");
+        buffered.read_blocked = true;
+        buffered.headers_buf().extend_from_slice(b"reply");
+        futures_util::future::poll_fn(|cx| buffered.poll_flush(cx)).await.unwrap();
+        assert_eq!(buffered.write_buf.remaining(), 0, "completed reply withheld by partial next header");
+    }
+
+    #[tokio::test]
+    async fn gateway_pipeline_shutdown_flushes_with_unconsumed_next_input() {
+        let mock = Mock::new().write(b"reply").build();
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(mock));
+        buffered.set_flush_pipeline(true);
+        buffered.read_buf.extend_from_slice(b"malformed next request");
+        buffered.headers_buf().extend_from_slice(b"reply");
+        futures_util::future::poll_fn(|cx| buffered.poll_shutdown(cx)).await.unwrap();
+        assert_eq!(buffered.write_buf.remaining(), 0, "shutdown discarded completed pipeline replies");
+    }
+
 
     #[tokio::test]
     #[ignore]

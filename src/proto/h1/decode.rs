@@ -141,6 +141,12 @@ impl Decoder {
         )
     }
 
+    /// Whether this decoder reads a `Content-Length` body, which is the only kind that can be taken whole.
+    #[cfg(feature = "server")]
+    pub(crate) fn is_length(&self) -> bool {
+        matches!(self.kind, Length(_))
+    }
+
     pub(crate) fn decode<R: MemRead>(
         &mut self,
         cx: &mut Context<'_>,

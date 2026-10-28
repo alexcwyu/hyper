@@ -42,6 +42,10 @@ pub struct Incoming {
 
 enum Kind {
     Empty,
+    /// A whole body that was already buffered when the head was parsed: no channel, no further passes of the
+    /// connection. `None` once its one chunk has been taken.
+    #[cfg(all(feature = "http1", feature = "server"))]
+    Ready(Option<Bytes>),
     #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
     Chan {
         content_length: DecodedLength,
@@ -95,6 +99,12 @@ impl Incoming {
 
     fn new(kind: Kind) -> Incoming {
         Incoming { kind }
+    }
+
+    /// A body whose bytes are all here.
+    #[cfg(all(feature = "http1", feature = "server"))]
+    pub(crate) fn ready(body: Bytes) -> Incoming {
+        Incoming::new(Kind::Ready(Some(body)))
     }
 
     #[allow(dead_code)]
@@ -164,6 +174,8 @@ impl Body for Incoming {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match &mut self.kind {
             Kind::Empty => Poll::Ready(None),
+            #[cfg(all(feature = "http1", feature = "server"))]
+            Kind::Ready(body) => Poll::Ready(body.take().map(|chunk| Ok(Frame::data(chunk)))),
             #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
             Kind::Chan {
                 content_length: len,
@@ -234,6 +246,8 @@ impl Body for Incoming {
     fn is_end_stream(&self) -> bool {
         match &self.kind {
             Kind::Empty => true,
+            #[cfg(all(feature = "http1", feature = "server"))]
+            Kind::Ready(body) => body.is_none(),
             #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
             Kind::Chan { content_length, .. } => *content_length == DecodedLength::ZERO,
             #[cfg(all(feature = "http2", any(feature = "client", feature = "server")))]
@@ -258,6 +272,8 @@ impl Body for Incoming {
 
         match self.kind {
             Kind::Empty => SizeHint::with_exact(0),
+            #[cfg(all(feature = "http1", feature = "server"))]
+            Kind::Ready(ref body) => SizeHint::with_exact(body.as_ref().map_or(0, |chunk| chunk.len() as u64)),
             #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
             Kind::Chan { content_length, .. } => opt_len(content_length),
             #[cfg(all(feature = "http2", any(feature = "client", feature = "server")))]

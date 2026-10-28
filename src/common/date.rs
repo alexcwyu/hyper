@@ -43,6 +43,20 @@ struct CachedDate {
 
 thread_local!(static CACHED: RefCell<CachedDate> = RefCell::new(CachedDate::new()));
 
+// Wall-clock samples taken by this thread's date cache, for the adaptation's regression test.
+#[cfg(test)]
+thread_local!(static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+
+#[cfg(test)]
+pub(crate) fn checks() -> usize {
+    CHECKS.with(|checks| checks.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_checks() {
+    CHECKS.with(|checks| checks.set(0));
+}
+
 impl CachedDate {
     fn new() -> Self {
         let mut cache = CachedDate {
@@ -61,6 +75,8 @@ impl CachedDate {
     }
 
     fn check(&mut self) {
+        #[cfg(test)]
+        CHECKS.with(|checks| checks.set(checks.get() + 1));
         let now = SystemTime::now();
         if now > self.next_update {
             self.update(now);

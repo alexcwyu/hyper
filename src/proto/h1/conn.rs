@@ -161,12 +161,26 @@ where
         self.state.date_header = false;
     }
 
+    /// Whether responses on this connection may carry a `Date` header, so the cached date is worth refreshing.
+    pub(crate) fn date_header_enabled(&self) -> bool {
+        self.state.date_header
+    }
+
     pub(crate) fn into_inner(self) -> (I, Bytes) {
         self.io.into_inner()
     }
 
     pub(crate) fn pending_upgrade(&mut self) -> Option<crate::upgrade::Pending> {
         self.state.upgrade.take()
+    }
+
+    pub(crate) fn has_pending_upgrade(&self) -> bool {
+        self.state.upgrade.is_some()
+    }
+
+    /// Flushes the reply that precedes an upgrade, whatever the peer has already sent behind it.
+    pub(crate) fn poll_flush_for_upgrade(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.io.poll_flush_now(cx)
     }
 
     pub(crate) fn is_read_closed(&self) -> bool {
@@ -426,6 +440,26 @@ where
         self.state.reading = reading;
         self.try_keep_alive(cx);
         ret
+    }
+
+    /// The body of the request whose head was just read, when it is a `Content-Length` body that is already in the
+    /// read buffer: the same chunk `poll_read_body` would deliver, taken at once, with the connection left exactly
+    /// as that read would leave it. `None` (nothing consumed) for any other body, which streams as before.
+    #[cfg(feature = "server")]
+    pub(crate) fn take_buffered_body(
+        &mut self,
+        cx: &mut Context<'_>,
+        length: DecodedLength,
+    ) -> Option<Bytes> {
+        let length = usize::try_from(length.into_opt()?).ok().filter(|n| *n > 0)?;
+        if !matches!(&self.state.reading, Reading::Body(decoder) if decoder.is_length()) {
+            return None;
+        }
+        let body = self.io.take_buffered(length)?;
+        debug!("incoming body completed");
+        self.state.reading = Reading::KeepAlive;
+        self.try_keep_alive(cx);
+        Some(body)
     }
 
     pub(crate) fn wants_read_again(&mut self) -> bool {
@@ -853,6 +887,9 @@ where
     }
 
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.state.wants_keep_alive() {
+            self.io.set_flush_pipeline(false);
+        }
         ready!(Pin::new(&mut self.io).poll_flush(cx))?;
         self.try_keep_alive(cx);
         trace!("flushed({}): {:?}", T::LOG, self.state);

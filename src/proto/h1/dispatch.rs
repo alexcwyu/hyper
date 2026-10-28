@@ -145,11 +145,18 @@ where
         cx: &mut Context<'_>,
         should_shutdown: bool,
     ) -> Poll<crate::Result<Dispatched>> {
-        T::update_date();
+        // Refreshing the cached date samples the wall clock on every poll; skip it when
+        // no response on this connection will write the header.
+        if self.conn.date_header_enabled() {
+            T::update_date();
+        }
 
         ready!(self.poll_loop(cx))?;
 
         if self.is_done() {
+            if self.conn.has_pending_upgrade() {
+                ready!(self.conn.poll_flush_for_upgrade(cx)).map_err(crate::Error::new_io)?;
+            }
             if let Some(pending) = self.conn.pending_upgrade() {
                 self.conn.take_error()?;
                 return Poll::Ready(Ok(Dispatched::Upgrade(pending)));
@@ -298,6 +305,33 @@ where
         }
     }
 
+    /// A server's request body that is already in the read buffer, handed over whole: it needs neither a channel
+    /// nor further passes of this loop to fill it. (A client's response body keeps streaming.)
+    #[cfg(feature = "server")]
+    fn take_buffered_body(
+        &mut self,
+        cx: &mut Context<'_>,
+        length: DecodedLength,
+        wants: Wants,
+    ) -> Option<IncomingBody> {
+        if !T::should_read_first() || wants.contains(Wants::EXPECT) {
+            return None;
+        }
+        self.conn
+            .take_buffered_body(cx, length)
+            .map(IncomingBody::ready)
+    }
+
+    #[cfg(not(feature = "server"))]
+    fn take_buffered_body(
+        &mut self,
+        _: &mut Context<'_>,
+        _: DecodedLength,
+        _: Wants,
+    ) -> Option<IncomingBody> {
+        None
+    }
+
     fn poll_read_head(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         // can dispatch receive, or does it still care about other incoming message?
         if let Ok(()) = ready!(self.dispatch.poll_ready(cx)) {
@@ -312,12 +346,15 @@ where
             Some(Ok((mut head, body_len, wants))) => {
                 let body = match body_len {
                     DecodedLength::ZERO => IncomingBody::empty(),
-                    other => {
-                        let (tx, rx) =
-                            IncomingBody::new_channel(other, wants.contains(Wants::EXPECT));
-                        self.body_tx.set(tx);
-                        rx
-                    }
+                    other => match self.take_buffered_body(cx, other, wants) {
+                        Some(body) => body,
+                        None => {
+                            let (tx, rx) =
+                                IncomingBody::new_channel(other, wants.contains(Wants::EXPECT));
+                            self.body_tx.set(tx);
+                            rx
+                        }
+                    },
                 };
                 if wants.contains(Wants::UPGRADE) {
                     let upgrade = self.conn.on_upgrade();
@@ -773,6 +810,40 @@ mod tests {
     use crate::common::io::Compat;
     use crate::proto::h1::ClientTransaction;
     use std::time::Duration;
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn a_server_without_the_date_header_never_samples_the_wall_clock() {
+        use crate::proto::h1::ServerTransaction;
+        use crate::service::service_fn;
+
+        let service = service_fn(|_req: crate::Request<IncomingBody>| async {
+            Ok::<_, std::convert::Infallible>(crate::Response::new(
+                http_body_util::Empty::<bytes::Bytes>::new(),
+            ))
+        });
+        crate::common::date::reset_checks();
+        tokio_test::task::spawn(()).enter(|cx, _| {
+            let (io, _handle) = tokio_test::io::Builder::new()
+                .read(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+                .write(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .build_with_handle();
+            let mut conn = Conn::<_, bytes::Bytes, ServerTransaction>::new(Compat::new(io));
+            conn.disable_date_header();
+            let mut dispatcher = Dispatcher::new(Server::new(service), conn);
+            for _ in 0..3 {
+                let _ = Pin::new(&mut dispatcher).poll(cx);
+            }
+        });
+        assert_eq!(
+            crate::common::date::checks(),
+            0,
+            "every connection poll refreshed a Date cache that is never written"
+        );
+        // Control: the counter does observe a refresh.
+        crate::common::date::update();
+        assert_eq!(crate::common::date::checks(), 1);
+    }
 
     #[test]
     fn client_read_bytes_before_writing_request() {
